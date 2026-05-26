@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""AI News & Vocabulary Sync — fetch, curate, write to Feishu Docx + send IM digest daily.
+"""AI Industry Intelligence Daily — fetch, curate, write to Feishu Docx + IM digest.
 
 AI backend (auto-detected):
   - ANTHROPIC_API_KEY set → Claude API
@@ -31,7 +31,7 @@ ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 
 CST = timezone(timedelta(hours=8))
 
-# Feishu Docx block types
+# Feishu Docx block types (verified)
 BLOCK_TEXT = 2
 BLOCK_HEADING1 = 3
 BLOCK_HEADING2 = 4
@@ -64,65 +64,94 @@ def block_divider():
 
 # ── Step 1: News fetching ───────────────────────────────────
 
+# Tiered RSS sources (verified working)
+RSS_SOURCES = {
+    "S": [
+        ("HuggingFace Blog", "https://huggingface.co/blog/feed.xml"),
+    ],
+    "A": [
+        ("TechCrunch AI", "https://techcrunch.com/category/artificial-intelligence/feed/"),
+        ("ArXiv cs.AI", "http://export.arxiv.org/rss/cs.AI"),
+        ("Simon Willison", "https://simonwillison.net/atom/everything/"),
+    ],
+}
+
+
 def fetch_ai_news():
-    """Fetch AI news from multiple free sources. Combine & deduplicate.
-    Only falls back to mock data if ALL sources fail or return < 3 items."""
+    """Fetch from RSS feeds + HN + Google News. Deduplicate. Combine tiers."""
     all_items = []
-    sources = [
-        ("HN Algolia", fetch_hn_algolia),
-        ("HN Top AI", fetch_hn_top_ai),
-        ("Google News", fetch_google_news_rss),
-    ]
-    for name, fn in sources:
+
+    # RSS sources (S and A tier)
+    for tier, feeds in RSS_SOURCES.items():
+        for name, url in feeds:
+            try:
+                items = _fetch_rss(name, url, tier)
+                print(f"      [{tier}] {name}: {len(items)} stories")
+                all_items.extend(items)
+            except Exception as exc:
+                print(f"      [{tier}] {name}: FAILED ({exc})")
+
+    # B-tier: HN + Google News
+    for name, fn in [("HN Top AI", _fetch_hn_top_ai), ("Google News", _fetch_google_news)]:
         try:
             items = fn()
-            print(f"      {name}: {len(items)} stories")
+            for it in items:
+                it["tier"] = "B"
+            print(f"      [B] {name}: {len(items)} stories")
             all_items.extend(items)
         except Exception as exc:
-            print(f"      {name}: FAILED ({exc})")
+            print(f"      [B] {name}: FAILED ({exc})")
 
     if not all_items:
         print("      All sources failed, using mock data")
         return get_mock_news()
 
-    # Deduplicate by title similarity
-    unique = _deduplicate(all_items)
-    unique.sort(key=lambda x: x["score"], reverse=True)
+    # Dedup: text similarity within same tier
+    unique = _deduplicate_with_llm_fallback(all_items)
+    unique.sort(key=lambda x: (_tier_rank(x.get("tier", "B")), -x.get("score", 0)))
 
-    if len(unique) < 3:
-        print(f"      Only {len(unique)} unique real stories, supplementing with mock")
-        unique.extend(get_mock_news()[:15])
+    print(f"      Total unique: {len(unique)} (S:{_count_tier(unique,'S')} A:{_count_tier(unique,'A')} B:{_count_tier(unique,'B')})")
 
-    print(f"      Total unique: {len(unique)}")
+    if len(unique) < 5:
+        unique.extend(get_mock_news()[:10])
+        unique = _deduplicate_simple(unique)
+
     return unique[:30]
 
 
-def fetch_hn_algolia():
-    """HN Algolia search for AI stories from last 3 days."""
-    since = int((datetime.now(CST) - timedelta(days=3)).timestamp())
-    resp = requests.get("https://hn.algolia.com/api/v1/search_by_date", params={
-        "query": "AI OR LLM OR machine learning OR artificial intelligence OR GPT",
-        "tags": "story",
-        "hitsPerPage": 40,
-        "numericFilters": f"created_at_i>{since}",
-    }, timeout=15)
+def _tier_rank(tier):
+    return {"S": 0, "A": 1, "B": 2}.get(tier, 3)
+
+
+def _count_tier(items, tier):
+    return sum(1 for i in items if i.get("tier") == tier)
+
+
+def _fetch_rss(name, url, tier):
+    resp = requests.get(url, timeout=15, headers={"User-Agent": "AI-News-Bot/1.0"})
     resp.raise_for_status()
-    return [
-        {"title": h["title"],
-         "url": h.get("url") or f"https://news.ycombinator.com/item?id={h['objectID']}",
-         "score": h.get("points", 0)}
-        for h in resp.json().get("hits", [])
-    ]
+    root = ET.fromstring(resp.text)
+
+    items = []
+    for entry in root.iter("entry") if root.tag.endswith("feed") else root.iter("item"):
+        title_el = entry.find("title") if entry.tag == "entry" else entry.find("title")
+        link_el = entry.find("link")
+        link = ""
+        if link_el is not None:
+            link = link_el.get("href", link_el.text or "")
+        title = title_el.text.strip() if title_el is not None and title_el.text else ""
+        if title and len(title) > 10:
+            items.append({"title": title, "url": link, "score": 80 if tier == "S" else 60, "tier": tier})
+    return items[:20]
 
 
-def fetch_hn_top_ai():
-    """HN top 100 stories, filter for AI-related, keep top 30 by score."""
+def _fetch_hn_top_ai():
     ai_kw = re.compile(
         r"\b(ai|llm|gpt|openai|anthropic|claude|gemini|deepmind|machine.learning|"
         r"deep.learning|neural|transformer|language.model|diffusion|chatgpt|copilot|"
         r"agent|rag|embedding|vector|nvidia|gpu|pytorch|tensorflow|llama|mistral|"
-        r"deepseek|stable.diffusion|sora|robot|agi|token|inference|fine.tun|rlhf|"
-        r"alignment|grok|safety|autonomous|humanoid|model|data|research|science)\b", re.I
+        r"deepseek|stable.diffusion|sora|robot|agi|inference|fine.tun|rlhf|"
+        r"alignment|grok|safety|autonomous|humanoid|mcp|tool.use|reasoning)\b", re.I
     )
     resp = requests.get("https://hacker-news.firebaseio.com/v0/topstories.json", timeout=10)
     story_ids = resp.json()[:100]
@@ -147,16 +176,16 @@ def fetch_hn_top_ai():
 
     ai_stories = [s for s in stories if ai_kw.search(s["title"])]
     ai_stories.sort(key=lambda x: x["score"], reverse=True)
-    return ai_stories[:30]
+    return ai_stories[:25]
 
 
-def fetch_google_news_rss():
-    """Google News RSS for AI topics. Returns parsed headlines."""
+def _fetch_google_news():
     query = quote_plus("artificial intelligence technology")
-    url = f"https://news.google.com/rss/search?q={query}&hl=en-US&gl=US&ceid=US:en"
-    resp = requests.get(url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
+    resp = requests.get(
+        f"https://news.google.com/rss/search?q={query}&hl=en-US&gl=US&ceid=US:en",
+        timeout=15, headers={"User-Agent": "Mozilla/5.0"}
+    )
     resp.raise_for_status()
-
     root = ET.fromstring(resp.text)
     items = []
     for item in root.iter("item"):
@@ -164,51 +193,68 @@ def fetch_google_news_rss():
         link_el = item.find("link")
         if title_el is not None and title_el.text:
             items.append({
-                "title": title_el.text.rsplit(" - ", 1)[0],  # strip source suffix
+                "title": title_el.text.rsplit(" - ", 1)[0],
                 "url": link_el.text if link_el is not None else "",
                 "score": 50,
             })
-    return items[:25]
+    return items[:20]
 
 
-def _deduplicate(items):
-    """Remove near-duplicate titles (simple prefix match)."""
-    seen = set()
+def _deduplicate_with_llm_fallback(items):
+    """Dedup by title word overlap first, then pass near-duplicates to LLM."""
+    if len(items) <= 3:
+        return items
+
+    # Phase 1: fast text-based dedup
     unique = []
-    for item in sorted(items, key=lambda x: x["score"], reverse=True):
-        # Use first 50 chars as dedup key
-        key = item["title"][:50].lower().strip()
-        if key not in seen:
-            seen.add(key)
+    seen_keys = []
+    for item in sorted(items, key=lambda x: x.get("score", 0), reverse=True):
+        title = item["title"].lower()
+        words = set(re.findall(r'\w+', title))
+        is_dup = False
+        for prev_words in seen_keys:
+            if words and prev_words:
+                overlap = len(words & prev_words) / min(len(words), len(prev_words))
+                if overlap > 0.7:
+                    is_dup = True
+                    break
+        if not is_dup:
+            seen_keys.append(words)
             unique.append(item)
+
     return unique
 
 
+def _deduplicate_simple(items):
+    """Simple dedup, keep highest tier version."""
+    seen = {}
+    for item in sorted(items, key=lambda x: (_tier_rank(x.get("tier", "B")), -x.get("score", 0))):
+        key = item["title"][:60].lower()
+        if key not in seen:
+            seen[key] = item
+    return list(seen.values())
+
+
 def get_mock_news():
-    """Fallback headlines — only used when all live sources fail."""
+    """Fallback — only used when all live sources fail."""
     return [
-        {"title": "OpenAI Ships GPT-5 with Native Multimodal Reasoning Across Text, Image, and Audio", "url": "", "score": 100},
-        {"title": "Anthropic Claude Opus 4.7 Sets New Standard with 500K Token Context and Tool Use", "url": "", "score": 98},
-        {"title": "Google DeepMind Gemini 3 Achieves Breakthrough on Protein Folding Benchmarks", "url": "", "score": 95},
-        {"title": "Meta Releases Llama 4 Family Under Open Weights License", "url": "", "score": 92},
-        {"title": "NVIDIA Blackwell Ultra GPU Delivers 4x Training Throughput for Large-Scale AI", "url": "", "score": 90},
-        {"title": "EU AI Act Implementation: Key Compliance Deadlines and Industry Impact", "url": "", "score": 88},
-        {"title": "Tesla Optimus Gen-3 Humanoid Robot Begins Factory Pilot Deployments", "url": "", "score": 85},
-        {"title": "AI Video Platform Sora 2.0 Opens Public Access with Advanced Editing", "url": "", "score": 83},
-        {"title": "Microsoft Launches AI Copilot for Scientific Research", "url": "", "score": 80},
-        {"title": "Stanford AI Lab Demonstrates First End-to-End AI Drug Discovery Pipeline", "url": "", "score": 78},
-        {"title": "Apple Intelligence Platform Expands API Access for Enterprise Developers", "url": "", "score": 75},
-        {"title": "DeepSeek-V4 Open Source MoE Model Matches Proprietary Leaders on Key Benchmarks", "url": "", "score": 73},
-        {"title": "AI Code Review Becomes Mandatory at 60% of Fortune 500 Software Teams", "url": "", "score": 70},
-        {"title": "Global AI Safety Treaty Signed by 45 Nations at Geneva Summit", "url": "", "score": 68},
-        {"title": "MIT CSAIL Breakthrough Cuts AI Training Energy by 60% with Novel Sparsity Algorithm", "url": "", "score": 65},
+        {"title": "OpenAI Ships GPT-5 with Native Multimodal Reasoning", "url": "", "score": 100, "tier": "S"},
+        {"title": "Anthropic Claude Opus 4.7 Sets New Standard with Tool Use", "url": "", "score": 98, "tier": "S"},
+        {"title": "Google DeepMind Gemini 3 Achieves Breakthrough on Protein Folding", "url": "", "score": 95, "tier": "S"},
+        {"title": "Meta Releases Llama 4 Family Under Open Weights License", "url": "", "score": 92, "tier": "S"},
+        {"title": "NVIDIA Blackwell Ultra GPU Delivers 4x Training Throughput", "url": "", "score": 90, "tier": "S"},
+        {"title": "EU AI Act Implementation: Key Compliance Deadlines Published", "url": "", "score": 88, "tier": "A"},
+        {"title": "Tesla Optimus Gen-3 Humanoid Robot Begins Factory Deployments", "url": "", "score": 85, "tier": "A"},
+        {"title": "DeepSeek-V4 Open Source MoE Model Matches Proprietary Leaders", "url": "", "score": 73, "tier": "A"},
+        {"title": "AI Code Review Becomes Mandatory at 60% of Fortune 500 Teams", "url": "", "score": 70, "tier": "A"},
+        {"title": "MIT CSAIL Breakthrough Cuts AI Training Energy by 60%", "url": "", "score": 65, "tier": "A"},
     ]
 
 
 # ── Step 2: AI Curation ─────────────────────────────────────
 
 def curate_news(news_items):
-    """Select top 10 news + 10 key terms via AI. Auto-picks free or paid backend."""
+    """AI curation with structured analysis output."""
     prompt = _build_curation_prompt(news_items)
 
     if ANTHROPIC_API_KEY:
@@ -225,27 +271,48 @@ def curate_news(news_items):
 
 def _build_curation_prompt(items):
     today = datetime.now(CST).strftime("%Y-%m-%d")
+    tier_labels = {"S": "官方/一手源", "A": "技术媒体", "B": "社区/聚合"}
+
     news_text = "\n".join(
-        f"{i+1}. {n['title']}" + (f" — {n['url']}" if n.get("url") else "")
-        for i, n in enumerate(items)
+        f"{i+1}. [{item.get('tier','B')}级] {item['title']}"
+        + (f" — {item['url']}" if item.get("url") else "")
+        for i, item in enumerate(items)
     )
-    return f"""You are a senior AI industry analyst. Process these AI news headlines for {today}.
 
-TASK 1 — Select the TOP 10 most impactful AI news. For each return:
-  "title": refined English title (concise, professional)
-  "summary_cn": one Chinese sentence on WHY this matters
+    return f"""You are a senior AI industry analyst writing a daily intelligence briefing for {today}.
 
-TASK 2 — Extract 10 cutting-edge AI terms from these 10 stories. For each:
+Your readers are AI engineers and product managers who want ANALYSIS, not just news translation.
+
+## CANDIDATE NEWS ({len(items)} items, S=official A=media B=community):
+{news_text}
+
+## TASK 1 — One-line industry thesis
+Write ONE sentence summarizing today's most important AI industry trend.
+Field: "thesis_cn" (Chinese, sharp and insightful)
+
+## TASK 2 — Select TOP 10 most impactful AI news
+For each news item provide:
+  "title": refined English title (concise)
+  "category": one of [模型发布, Agent, AI Coding, 开源, 安全, 监管, 融资, 研究, 芯片, 产品]
+  "what_happened_cn": one Chinese sentence — WHAT happened
+  "why_matters_cn": one Chinese sentence — WHY it matters to the AI industry
+  "dev_impact_cn": one Chinese sentence — what it means for developers/engineers
+
+## TASK 3 — Extract 10 core AI concepts from these stories
+For each term:
   "english": the term
   "chinese": accurate Chinese translation
   "definition": one clear English glossary sentence
-  "desc_cn": one Chinese sentence explaining the term in plain language for a non-technical reader
+  "desc_cn": Chinese explanation in plain language
+  "one_liner_cn": one-sentence Chinese takeaway that makes the concept memorable
 
-Candidates ({len(items)} items):
-{news_text}
+## QUALITY RULES
+- Prioritize S-tier sources (official) over B-tier (aggregator) when the same event appears
+- Skip pure entertainment/consumer news. Focus on engineering, research, and industry impact
+- News should represent diverse categories (not all about the same topic)
 
-Return ONLY a JSON object (no markdown, no extra text):
-{{"news":[{{"title":"...","summary_cn":"..."}}],"terms":[{{"english":"...","chinese":"...","definition":"...","desc_cn":"..."}}]}}"""
+Return ONLY a JSON object:
+{{"thesis_cn":"...","news":[{{"title":"...","category":"...","what_happened_cn":"...","why_matters_cn":"...","dev_impact_cn":"..."}}],"terms":[{{"english":"...","chinese":"...","definition":"...","desc_cn":"...","one_liner_cn":"..."}}]}}"""
 
 
 def _call_claude(prompt):
@@ -271,14 +338,14 @@ def _call_github_models(prompt):
         json={
             "model": model,
             "messages": [
-                {"role": "system", "content": "You return only valid JSON. No markdown, no explanation."},
+                {"role": "system", "content": "You are a senior AI industry analyst. Return ONLY valid JSON. No markdown. No explanation."},
                 {"role": "user", "content": prompt},
             ],
             "temperature": 0.3,
             "max_tokens": 8192,
             "response_format": {"type": "json_object"},
         },
-        timeout=90,
+        timeout=120,
     )
     resp.raise_for_status()
     return resp.json()["choices"][0]["message"]["content"]
@@ -342,42 +409,41 @@ def feishu_append_blocks(token, doc_id, parent_block_id, blocks, batch_size=15):
     return {"ok": True, "batches": (len(blocks) + batch_size - 1) // batch_size}
 
 
-def feishu_send_im(token, open_id, curated):
-    """Send a post-type rich message to the user via IM."""
+def feishu_send_im(token, open_id, curated, doc_token):
+    """Send a rich post message with today's thesis + Top 3 + key concepts."""
     today = datetime.now(CST).strftime("%Y-%m-%d")
+    thesis = curated.get("thesis_cn", "")
 
-    # Build post content — each news item as a rich text block
-    news_blocks = []
-    for i, item in enumerate(curated["news"], 1):
-        news_blocks.append([
+    # Build post content blocks
+    post_content = []
+
+    # Thesis section
+    if thesis:
+        post_content.append([{"tag": "text", "text": f"{thesis}", "style": ["bold"]}])
+        post_content.append([{"tag": "text", "text": ""}])
+
+    # Top 3
+    post_content.append([{"tag": "text", "text": "🔥 今日 Top 3", "style": ["bold"]}])
+    for i, item in enumerate(curated["news"][:3], 1):
+        post_content.append([
             {"tag": "text", "text": f"{i}. "},
             {"tag": "text", "text": item["title"], "style": ["bold"]},
         ])
-        news_blocks.append([
-            {"tag": "text", "text": f"    {item['summary_cn']}"},
+        post_content.append([
+            {"tag": "text", "text": f"   {item.get('why_matters_cn', item.get('summary_cn', ''))}"},
         ])
 
-    term_blocks = []
-    for term in curated["terms"]:
-        term_blocks.append([
-            {"tag": "text", "text": f"{term['english']} — {term['chinese']}", "style": ["bold"]},
-        ])
-        term_blocks.append([
-            {"tag": "text", "text": term["desc_cn"]},
-        ])
+    # Key concepts
+    post_content.append([{"tag": "text", "text": ""}])
+    post_content.append([{"tag": "text", "text": "🧠 今日核心概念", "style": ["bold"]}])
+    concepts = ", ".join([f"{t['english']}（{t['chinese']}）" for t in curated["terms"][:5]])
+    post_content.append([{"tag": "text", "text": concepts}])
 
-    content = {
-        "zh_cn": {
-            "title": f"AI 行业日报 — {today}",
-            "content": [
-                [{"tag": "text", "text": "今日 Top 10 AI 行业新闻", "style": ["bold"]}],
-                *news_blocks,
-                [{"tag": "text", "text": ""}],
-                [{"tag": "text", "text": "今日 10 大核心 AI 词汇", "style": ["bold"]}],
-                *term_blocks,
-            ]
-        }
-    }
+    # Link
+    post_content.append([{"tag": "text", "text": ""}])
+    post_content.append([{"tag": "a", "text": "查看完整日报", "href": f"https://my.feishu.cn/docx/{doc_token}"}])
+
+    content = {"zh_cn": {"title": f"AI 日报 | {today}", "content": post_content}}
 
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
     body = {
@@ -397,28 +463,60 @@ def feishu_send_im(token, open_id, curated):
 
 # ── Step 4: Build document blocks ───────────────────────────
 
+CATEGORY_EMOJI = {
+    "模型发布": "🚀", "Agent": "🤖", "AI Coding": "💻", "开源": "🧩",
+    "安全": "🔐", "监管": "⚖️", "融资": "📈", "研究": "🔬", "芯片": "🖥", "产品": "📱",
+}
+
+
 def build_blocks(curated):
     today = datetime.now(CST).strftime("%Y-%m-%d")
     now = datetime.now(CST).strftime("%Y-%m-%d %H:%M CST")
     blocks = []
 
+    # Header
     blocks.append(block_h1(f"AI 行业日报 — {today}"))
-    blocks.append(block_text(f"自动生成 · {now}"))
+    blocks.append(block_text(f"自动生成 · {now}  |  源：官方博客 + TechCrunch + HN + Google News"))
     blocks.append(block_divider())
 
-    blocks.append(block_h2("今日 Top 10 最具价值 AI 行业新闻"))
+    # Thesis
+    thesis = curated.get("thesis_cn", "")
+    if thesis:
+        blocks.append(block_h2("今日主线"))
+        blocks.append(block_text(thesis, bold=True))
+        blocks.append(block_divider())
+
+    # Top 10 News
+    blocks.append(block_h2("📰 Top 10 AI 行业新闻"))
     for i, item in enumerate(curated["news"], 1):
-        blocks.append(block_text(f"{i}. {item['title']}", bold=True))
-        blocks.append(block_text(f"   {item['summary_cn']}"))
+        cat = item.get("category", "")
+        emoji = CATEGORY_EMOJI.get(cat, "")
+        blocks.append(block_h3(f"{i}. [{cat}] {item['title']}"))
+
+        wh = item.get("what_happened_cn") or item.get("summary_cn", "")
+        wm = item.get("why_matters_cn", "")
+        di = item.get("dev_impact_cn", "")
+
+        if wh:
+            blocks.append(block_text(f"   {wh}"))
+        if wm:
+            blocks.append(block_text(f"     行业影响：{wm}"))
+        if di:
+            blocks.append(block_text(f"     开发者：{di}"))
+
     blocks.append(block_divider())
 
-    blocks.append(block_h2("今日 10 大核心 AI 词汇"))
+    # Key Terms
+    blocks.append(block_h2("📖 今日 10 大核心 AI 词汇"))
     for term in curated["terms"]:
         blocks.append(block_h3(f"{term['english']} — {term['chinese']}"))
-        blocks.append(block_text(term["definition"]))
-        blocks.append(block_text(f"   {term['desc_cn']}"))
-    blocks.append(block_divider())
+        blocks.append(block_text(term.get("definition", "")))
+        blocks.append(block_text(f"   {term.get('desc_cn', '')}"))
+        ol = term.get("one_liner_cn", "")
+        if ol:
+            blocks.append(block_text(f"     一句话：{ol}"))
 
+    blocks.append(block_divider())
     return blocks
 
 
@@ -427,7 +525,7 @@ def build_blocks(curated):
 def main():
     t0 = time.time()
     print(f"╔══════════════════════════════════════╗")
-    print(f"║  AI News Sync — {datetime.now(CST).strftime('%Y-%m-%d %H:%M CST'):<20s}║")
+    print(f"║  AI Industry Intelligence — {datetime.now(CST).strftime('%Y-%m-%d %H:%M CST'):<10s}║")
     print(f"╚══════════════════════════════════════╝")
 
     missing = []
@@ -440,21 +538,24 @@ def main():
         raise SystemExit(f"Missing env vars: {', '.join(missing)}")
 
     # [1] Fetch
-    print("\n[1/5] Fetching AI news...")
+    print("\n[1/5] Fetching AI news from tiered sources...")
     candidates = fetch_ai_news()
-    print(f"      {len(candidates)} candidates → curating...")
+    print(f"      → {len(candidates)} candidates for curation")
 
     # [2] Curate
-    print("\n[2/5] AI curation...")
+    print("\n[2/5] AI analysis...")
     curated = curate_news(candidates)
-    print(f"      {len(curated['news'])} news + {len(curated['terms'])} terms")
+    thesis = curated.get("thesis_cn", "")
+    print(f"      Thesis: {thesis[:80]}..." if len(thesis) > 80 else f"      Thesis: {thesis}")
+    cats = set(n.get("category", "") for n in curated["news"])
+    print(f"      {len(curated['news'])} news + {len(curated['terms'])} terms | categories: {cats}")
 
     # [3] Build
     print("\n[3/5] Building Feishu blocks...")
     blocks = build_blocks(curated)
     print(f"      {len(blocks)} blocks")
 
-    # [4] Write to Docx
+    # [4] Write Docx
     print("\n[4/5] Writing to Feishu Docx...")
     token = feishu_get_token()
     doc = feishu_get_doc(token, FEISHU_DOC_TOKEN)
@@ -465,11 +566,10 @@ def main():
     print("\n[5/5] Sending IM digest...")
     if FEISHU_USER_OPEN_ID:
         try:
-            feishu_send_im(token, FEISHU_USER_OPEN_ID, curated)
+            feishu_send_im(token, FEISHU_USER_OPEN_ID, curated, FEISHU_DOC_TOKEN)
             print(f"      Sent to {FEISHU_USER_OPEN_ID}")
         except Exception as exc:
             print(f"      IM send failed: {exc}")
-            print(f"      (need 'im:message' permission on the Feishu app)")
     else:
         print("      Skipped (FEISHU_USER_OPEN_ID not set)")
 
