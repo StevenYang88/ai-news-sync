@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""AI News & Vocabulary Sync — fetch, curate, and write to Feishu Docx daily.
+"""AI News & Vocabulary Sync — fetch, curate, write to Feishu Docx + send IM digest daily.
 
 AI backend (auto-detected):
   - ANTHROPIC_API_KEY set → Claude API
@@ -11,8 +11,10 @@ import json
 import os
 import re
 import time
+import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
+from urllib.parse import quote_plus
 
 import requests
 from dotenv import load_dotenv
@@ -23,6 +25,7 @@ load_dotenv()
 FEISHU_APP_ID = os.getenv("FEISHU_APP_ID")
 FEISHU_APP_SECRET = os.getenv("FEISHU_APP_SECRET")
 FEISHU_DOC_TOKEN = os.getenv("FEISHU_DOC_TOKEN")
+FEISHU_USER_OPEN_ID = os.getenv("FEISHU_USER_OPEN_ID", "")
 GH_PAT = os.getenv("GH_PAT")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 
@@ -33,38 +36,27 @@ BLOCK_TEXT = 2
 BLOCK_HEADING1 = 3
 BLOCK_HEADING2 = 4
 BLOCK_HEADING3 = 5
-BLOCK_ORDERED = 13
 BLOCK_DIVIDER = 22
 
 # ── Block builders ──────────────────────────────────────────
 
 def _el(content, bold=False):
-    """Make a text_run element."""
     el = {"text_run": {"content": content}}
     if bold:
         el["text_run"]["text_element_style"] = {"bold": True}
     return el
 
-
 def block_text(content, bold=False):
     return {"block_type": BLOCK_TEXT, "text": {"elements": [_el(content, bold=bold)]}}
-
 
 def block_h1(content):
     return {"block_type": BLOCK_HEADING1, "heading1": {"elements": [_el(content)]}}
 
-
 def block_h2(content):
     return {"block_type": BLOCK_HEADING2, "heading2": {"elements": [_el(content)]}}
 
-
 def block_h3(content):
     return {"block_type": BLOCK_HEADING3, "heading3": {"elements": [_el(content)]}}
-
-
-def block_ordered(content, bold=False):
-    return {"block_type": BLOCK_ORDERED, "ordered": {"elements": [_el(content, bold=bold)]}}
-
 
 def block_divider():
     return {"block_type": BLOCK_DIVIDER, "divider": {}}
@@ -73,49 +65,67 @@ def block_divider():
 # ── Step 1: News fetching ───────────────────────────────────
 
 def fetch_ai_news():
-    """Fetch AI news from free sources. Falls back to mock data."""
-    sources = [fetch_hn_algolia, fetch_hn_top_ai]
-    for src in sources:
+    """Fetch AI news from multiple free sources. Combine & deduplicate.
+    Only falls back to mock data if ALL sources fail or return < 3 items."""
+    all_items = []
+    sources = [
+        ("HN Algolia", fetch_hn_algolia),
+        ("HN Top AI", fetch_hn_top_ai),
+        ("Google News", fetch_google_news_rss),
+    ]
+    for name, fn in sources:
         try:
-            items = src()
-            if items and len(items) >= 5:
-                return items
+            items = fn()
+            print(f"      {name}: {len(items)} stories")
+            all_items.extend(items)
         except Exception as exc:
-            print(f"  [WARN] {src.__name__} failed: {exc}")
-    print("  [INFO] Using mock data")
-    return get_mock_news()
+            print(f"      {name}: FAILED ({exc})")
+
+    if not all_items:
+        print("      All sources failed, using mock data")
+        return get_mock_news()
+
+    # Deduplicate by title similarity
+    unique = _deduplicate(all_items)
+    unique.sort(key=lambda x: x["score"], reverse=True)
+
+    if len(unique) < 3:
+        print(f"      Only {len(unique)} unique real stories, supplementing with mock")
+        unique.extend(get_mock_news()[:15])
+
+    print(f"      Total unique: {len(unique)}")
+    return unique[:30]
 
 
 def fetch_hn_algolia():
-    """HN Algolia search for AI-related stories from the last 2 days."""
-    since = int((datetime.now(CST) - timedelta(days=2)).timestamp())
-    url = "https://hn.algolia.com/api/v1/search_by_date"
-    resp = requests.get(url, params={
-        "query": "AI OR LLM OR machine learning OR artificial intelligence",
+    """HN Algolia search for AI stories from last 3 days."""
+    since = int((datetime.now(CST) - timedelta(days=3)).timestamp())
+    resp = requests.get("https://hn.algolia.com/api/v1/search_by_date", params={
+        "query": "AI OR LLM OR machine learning OR artificial intelligence OR GPT",
         "tags": "story",
-        "hitsPerPage": 30,
+        "hitsPerPage": 40,
         "numericFilters": f"created_at_i>{since}",
     }, timeout=15)
     resp.raise_for_status()
     return [
-        {"title": h["title"], "url": h.get("url") or f"https://news.ycombinator.com/item?id={h['objectID']}",
+        {"title": h["title"],
+         "url": h.get("url") or f"https://news.ycombinator.com/item?id={h['objectID']}",
          "score": h.get("points", 0)}
         for h in resp.json().get("hits", [])
     ]
 
 
 def fetch_hn_top_ai():
-    """Fetch HN top stories, filter for AI-related, return top 25 by score."""
-    ai_pattern = re.compile(
-        r"\b(ai|llm|gpt|openai|anthropic|claude|gemini|machine.learning|deep.learning|"
-        r"neural|transformer|language.model|diffusion|midjourney|chatgpt|copilot|agent|"
-        r"rag|embedding|vector|nvidia|gpu|pytorch|tensorflow|jax|llama|mistral|"
-        r"deepseek|stable.diffusion|sora|robot|agi|token|inference|fine.tun|"
-        r"rlhf|alignment|grok|safety|autonomous|humanoid)\b", re.I
+    """HN top 100 stories, filter for AI-related, keep top 30 by score."""
+    ai_kw = re.compile(
+        r"\b(ai|llm|gpt|openai|anthropic|claude|gemini|deepmind|machine.learning|"
+        r"deep.learning|neural|transformer|language.model|diffusion|chatgpt|copilot|"
+        r"agent|rag|embedding|vector|nvidia|gpu|pytorch|tensorflow|llama|mistral|"
+        r"deepseek|stable.diffusion|sora|robot|agi|token|inference|fine.tun|rlhf|"
+        r"alignment|grok|safety|autonomous|humanoid|model|data|research|science)\b", re.I
     )
-
     resp = requests.get("https://hacker-news.firebaseio.com/v0/topstories.json", timeout=10)
-    story_ids = resp.json()[:80]
+    story_ids = resp.json()[:100]
 
     def _fetch(sid):
         try:
@@ -135,13 +145,47 @@ def fetch_hn_top_ai():
             if r:
                 stories.append(r)
 
-    ai_stories = [s for s in stories if ai_pattern.search(s["title"])]
+    ai_stories = [s for s in stories if ai_kw.search(s["title"])]
     ai_stories.sort(key=lambda x: x["score"], reverse=True)
-    return ai_stories[:25]
+    return ai_stories[:30]
+
+
+def fetch_google_news_rss():
+    """Google News RSS for AI topics. Returns parsed headlines."""
+    query = quote_plus("artificial intelligence technology")
+    url = f"https://news.google.com/rss/search?q={query}&hl=en-US&gl=US&ceid=US:en"
+    resp = requests.get(url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
+    resp.raise_for_status()
+
+    root = ET.fromstring(resp.text)
+    items = []
+    for item in root.iter("item"):
+        title_el = item.find("title")
+        link_el = item.find("link")
+        if title_el is not None and title_el.text:
+            items.append({
+                "title": title_el.text.rsplit(" - ", 1)[0],  # strip source suffix
+                "url": link_el.text if link_el is not None else "",
+                "score": 50,
+            })
+    return items[:25]
+
+
+def _deduplicate(items):
+    """Remove near-duplicate titles (simple prefix match)."""
+    seen = set()
+    unique = []
+    for item in sorted(items, key=lambda x: x["score"], reverse=True):
+        # Use first 50 chars as dedup key
+        key = item["title"][:50].lower().strip()
+        if key not in seen:
+            seen.add(key)
+            unique.append(item)
+    return unique
 
 
 def get_mock_news():
-    """Curated fallback headlines (updated periodically)."""
+    """Fallback headlines — only used when all live sources fail."""
     return [
         {"title": "OpenAI Ships GPT-5 with Native Multimodal Reasoning Across Text, Image, and Audio", "url": "", "score": 100},
         {"title": "Anthropic Claude Opus 4.7 Sets New Standard with 500K Token Context and Tool Use", "url": "", "score": 98},
@@ -164,7 +208,7 @@ def get_mock_news():
 # ── Step 2: AI Curation ─────────────────────────────────────
 
 def curate_news(news_items):
-    """Select top 10 news + 5 key terms via AI. Auto-picks free or paid backend."""
+    """Select top 10 news + 10 key terms via AI. Auto-picks free or paid backend."""
     prompt = _build_curation_prompt(news_items)
 
     if ANTHROPIC_API_KEY:
@@ -174,7 +218,7 @@ def curate_news(news_items):
         print("  [AI] Using GitHub Models (free tier)")
         result = _call_github_models(prompt)
     else:
-        raise SystemExit("Neither ANTHROPIC_API_KEY nor GITHUB_PAT is set. Need at least one.")
+        raise SystemExit("Neither ANTHROPIC_API_KEY nor GH_PAT is set.")
 
     return _extract_json(result)
 
@@ -237,14 +281,11 @@ def _call_github_models(prompt):
         timeout=90,
     )
     resp.raise_for_status()
-    data = resp.json()
-    return data["choices"][0]["message"]["content"]
+    return resp.json()["choices"][0]["message"]["content"]
 
 
 def _extract_json(text):
-    """Robust JSON extraction from LLM output."""
     text = text.strip()
-    # Strip code fences
     for fence in ("```json", "```"):
         i = text.find(fence)
         if i != -1:
@@ -252,7 +293,6 @@ def _extract_json(text):
             if text.endswith("```"):
                 text = text[:-3]
             break
-    # Find outermost braces
     start = text.find("{")
     end = text.rfind("}")
     if start != -1 and end != -1 and end > start:
@@ -302,6 +342,59 @@ def feishu_append_blocks(token, doc_id, parent_block_id, blocks, batch_size=15):
     return {"ok": True, "batches": (len(blocks) + batch_size - 1) // batch_size}
 
 
+def feishu_send_im(token, open_id, curated):
+    """Send a post-type rich message to the user via IM."""
+    today = datetime.now(CST).strftime("%Y-%m-%d")
+
+    # Build post content — each news item as a rich text block
+    news_blocks = []
+    for i, item in enumerate(curated["news"], 1):
+        news_blocks.append([
+            {"tag": "text", "text": f"{i}. "},
+            {"tag": "text", "text": item["title"], "style": ["bold"]},
+        ])
+        news_blocks.append([
+            {"tag": "text", "text": f"    {item['summary_cn']}"},
+        ])
+
+    term_blocks = []
+    for term in curated["terms"]:
+        term_blocks.append([
+            {"tag": "text", "text": f"{term['english']} — {term['chinese']}", "style": ["bold"]},
+        ])
+        term_blocks.append([
+            {"tag": "text", "text": term["desc_cn"]},
+        ])
+
+    content = {
+        "zh_cn": {
+            "title": f"AI 行业日报 — {today}",
+            "content": [
+                [{"tag": "text", "text": "今日 Top 10 AI 行业新闻", "style": ["bold"]}],
+                *news_blocks,
+                [{"tag": "text", "text": ""}],
+                [{"tag": "text", "text": "今日 10 大核心 AI 词汇", "style": ["bold"]}],
+                *term_blocks,
+            ]
+        }
+    }
+
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+    body = {
+        "receive_id": open_id,
+        "msg_type": "post",
+        "content": json.dumps(content, ensure_ascii=False),
+    }
+    resp = requests.post(
+        "https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=open_id",
+        headers=headers, json=body, timeout=15,
+    )
+    data = resp.json()
+    if data.get("code") != 0:
+        raise Exception(f"IM send error {data.get('code')}: {data.get('msg')}")
+    return data
+
+
 # ── Step 4: Build document blocks ───────────────────────────
 
 def build_blocks(curated):
@@ -313,14 +406,12 @@ def build_blocks(curated):
     blocks.append(block_text(f"自动生成 · {now}"))
     blocks.append(block_divider())
 
-    # ── Top 10 News ──
     blocks.append(block_h2("今日 Top 10 最具价值 AI 行业新闻"))
     for i, item in enumerate(curated["news"], 1):
         blocks.append(block_text(f"{i}. {item['title']}", bold=True))
         blocks.append(block_text(f"   {item['summary_cn']}"))
     blocks.append(block_divider())
 
-    # ── Key Terms ──
     blocks.append(block_h2("今日 10 大核心 AI 词汇"))
     for term in curated["terms"]:
         blocks.append(block_h3(f"{term['english']} — {term['chinese']}"))
@@ -339,7 +430,6 @@ def main():
     print(f"║  AI News Sync — {datetime.now(CST).strftime('%Y-%m-%d %H:%M CST'):<20s}║")
     print(f"╚══════════════════════════════════════╝")
 
-    # Validate
     missing = []
     for k in ("FEISHU_APP_ID", "FEISHU_APP_SECRET", "FEISHU_DOC_TOKEN"):
         if not os.getenv(k):
@@ -350,26 +440,38 @@ def main():
         raise SystemExit(f"Missing env vars: {', '.join(missing)}")
 
     # [1] Fetch
-    print("\n[1/4] Fetching AI news...")
+    print("\n[1/5] Fetching AI news...")
     candidates = fetch_ai_news()
-    print(f"      {len(candidates)} candidate stories")
+    print(f"      {len(candidates)} candidates → curating...")
 
     # [2] Curate
-    print("\n[2/4] AI curation...")
+    print("\n[2/5] AI curation...")
     curated = curate_news(candidates)
     print(f"      {len(curated['news'])} news + {len(curated['terms'])} terms")
 
     # [3] Build
-    print("\n[3/4] Building Feishu blocks...")
+    print("\n[3/5] Building Feishu blocks...")
     blocks = build_blocks(curated)
-    print(f"      {len(blocks)} blocks constructed")
+    print(f"      {len(blocks)} blocks")
 
-    # [4] Write
-    print("\n[4/4] Writing to Feishu Docx...")
+    # [4] Write to Docx
+    print("\n[4/5] Writing to Feishu Docx...")
     token = feishu_get_token()
     doc = feishu_get_doc(token, FEISHU_DOC_TOKEN)
     feishu_append_blocks(token, FEISHU_DOC_TOKEN, doc["document_id"], blocks)
-    print(f"      Appended to document {FEISHU_DOC_TOKEN}")
+    print(f"      Appended to {FEISHU_DOC_TOKEN}")
+
+    # [5] Send IM
+    print("\n[5/5] Sending IM digest...")
+    if FEISHU_USER_OPEN_ID:
+        try:
+            feishu_send_im(token, FEISHU_USER_OPEN_ID, curated)
+            print(f"      Sent to {FEISHU_USER_OPEN_ID}")
+        except Exception as exc:
+            print(f"      IM send failed: {exc}")
+            print(f"      (need 'im:message' permission on the Feishu app)")
+    else:
+        print("      Skipped (FEISHU_USER_OPEN_ID not set)")
 
     print(f"\n{'─' * 40}")
     print(f"Done in {time.time() - t0:.1f}s")
