@@ -3,7 +3,7 @@
 
 AI backend (auto-detected):
   - ANTHROPIC_API_KEY set → Claude API
-  - GITHUB_PAT set          → GitHub Models free tier (GPT-4o-mini)
+  - GH_PAT set              → GitHub Models free tier (GPT-4o-mini)
   At least one must be configured.
 """
 
@@ -23,7 +23,7 @@ load_dotenv()
 FEISHU_APP_ID = os.getenv("FEISHU_APP_ID")
 FEISHU_APP_SECRET = os.getenv("FEISHU_APP_SECRET")
 FEISHU_DOC_TOKEN = os.getenv("FEISHU_DOC_TOKEN")
-GITHUB_PAT = os.getenv("GITHUB_PAT")
+GH_PAT = os.getenv("GH_PAT")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 
 CST = timezone(timedelta(hours=8))
@@ -170,7 +170,7 @@ def curate_news(news_items):
     if ANTHROPIC_API_KEY:
         print("  [AI] Using Anthropic Claude API")
         result = _call_claude(prompt)
-    elif GITHUB_PAT:
+    elif GH_PAT:
         print("  [AI] Using GitHub Models (free tier)")
         result = _call_github_models(prompt)
     else:
@@ -221,7 +221,7 @@ def _call_github_models(prompt):
     resp = requests.post(
         "https://models.inference.ai.azure.com/chat/completions",
         headers={
-            "Authorization": f"Bearer {GITHUB_PAT}",
+            "Authorization": f"Bearer {GH_PAT}",
             "Content-Type": "application/json",
         },
         json={
@@ -344,8 +344,8 @@ def main():
     for k in ("FEISHU_APP_ID", "FEISHU_APP_SECRET", "FEISHU_DOC_TOKEN"):
         if not os.getenv(k):
             missing.append(k)
-    if not ANTHROPIC_API_KEY and not GITHUB_PAT:
-        missing.append("ANTHROPIC_API_KEY or GITHUB_PAT")
+    if not ANTHROPIC_API_KEY and not GH_PAT:
+        missing.append("ANTHROPIC_API_KEY or GH_PAT")
     if missing:
         raise SystemExit(f"Missing env vars: {', '.join(missing)}")
 
