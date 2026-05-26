@@ -1,0 +1,28 @@
+name: Daily AI News Sync
+
+on:
+  schedule:
+    - cron: '47 0 * * *'     # 8:47 AM Beijing time (UTC+8), off-peak minute
+  workflow_dispatch:          # manual trigger
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run sync
+        env:
+          FEISHU_APP_ID: ${{ secrets.FEISHU_APP_ID }}
+          FEISHU_APP_SECRET: ${{ secrets.FEISHU_APP_SECRET }}
+          FEISHU_DOC_TOKEN: ${{ secrets.FEISHU_DOC_TOKEN }}
+          GITHUB_PAT: ${{ secrets.GITHUB_PAT }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: python main.py
