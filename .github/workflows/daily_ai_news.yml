@@ -2,7 +2,7 @@ name: Daily AI News Sync
 
 on:
   schedule:
-    - cron: '13 1 * * *'     # 9:13 AM Beijing time (UTC+8), off-peak to avoid scheduler delays
+    - cron: '30 1 * * *'     # 9:30 AM Beijing time (UTC+8)
   workflow_dispatch:          # manual trigger
 
 jobs:
