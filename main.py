@@ -298,13 +298,25 @@ For each news item provide:
   "why_matters_cn": one Chinese sentence — WHY it matters to the AI industry
   "dev_impact_cn": one Chinese sentence — what it means for developers/engineers
 
-## TASK 3 — Extract 10 core AI concepts from these stories
+## TASK 3 — Extract 10 UNIQUE terms FROM TODAY'S NEWS
+**CRITICAL: Each term MUST be directly extracted from a specific news story above. These are NOT generic AI vocabulary — they are the specific concepts, products, techniques, or companies that made news TODAY.**
+
 For each term:
-  "english": the term
+  "english": the specific term (product name, technique, paper, company move, framework — NOT generic AI jargon)
   "chinese": accurate Chinese translation
-  "definition": one clear English glossary sentence
+  "definition": one clear English sentence defining what this is
   "desc_cn": Chinese explanation in plain language
-  "one_liner_cn": one-sentence Chinese takeaway that makes the concept memorable
+  "one_liner_cn": one-sentence Chinese takeaway
+  "from_news_index": which news item (1-10) this term came from
+
+**BANNED generic terms (DO NOT use):**
+LLM, RAG, Agent, AI Agent, Machine Learning, Deep Learning, Neural Network, Transformer, GPT, Fine-tuning, Prompt Engineering, Embedding, Vector Database, RLHF, Hallucination, Token, API, Open Source, Alignment, Inference
+
+**GOOD examples (specific to today's news):**
+- "Nemotron Diffusion Language Models" (if Nemotron was in today's news)
+- "Copilot Cowork File Exfiltration" (if Microsoft Copilot incident was reported)
+- "Constraint Decay in LLM Agents" (if a specific paper about this was published)
+- "OlmoEarth Satellite Model Family" (if AI Earth observation was announced)
 
 ## QUALITY RULES
 - Prioritize S-tier sources (official) over B-tier (aggregator) when the same event appears
@@ -312,7 +324,7 @@ For each term:
 - News should represent diverse categories (not all about the same topic)
 
 Return ONLY a JSON object:
-{{"thesis_cn":"...","news":[{{"title":"...","category":"...","what_happened_cn":"...","why_matters_cn":"...","dev_impact_cn":"..."}}],"terms":[{{"english":"...","chinese":"...","definition":"...","desc_cn":"...","one_liner_cn":"..."}}]}}"""
+{{"thesis_cn":"...","news":[{{"title":"...","category":"...","what_happened_cn":"...","why_matters_cn":"...","dev_impact_cn":"..."}}],"terms":[{{"english":"...","chinese":"...","definition":"...","desc_cn":"...","one_liner_cn":"...","from_news_index":0}}]}}"""
 
 
 def _call_claude(prompt):
@@ -509,7 +521,13 @@ def build_blocks(curated):
     # Key Terms
     blocks.append(block_h2("📖 今日 10 大核心 AI 词汇"))
     for term in curated["terms"]:
-        blocks.append(block_h3(f"{term['english']} — {term['chinese']}"))
+        news_ref = ""
+        idx = term.get("from_news_index", 0)
+        if isinstance(idx, int) and 1 <= idx <= len(curated.get("news", [])):
+            ref_title = curated["news"][idx - 1].get("title", "")
+            if ref_title:
+                news_ref = f"  ← 新闻 #{idx}"
+        blocks.append(block_h3(f"{term['english']} — {term['chinese']}{news_ref}"))
         blocks.append(block_text(term.get("definition", "")))
         blocks.append(block_text(f"   {term.get('desc_cn', '')}"))
         ol = term.get("one_liner_cn", "")
