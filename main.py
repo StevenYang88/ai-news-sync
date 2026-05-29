@@ -215,7 +215,7 @@ def _deduplicate_with_llm_fallback(items):
         for prev_words in seen_keys:
             if words and prev_words:
                 overlap = len(words & prev_words) / min(len(words), len(prev_words))
-                if overlap > 0.7:
+                if overlap > 0.4:
                     is_dup = True
                     break
         if not is_dup:
@@ -319,6 +319,7 @@ LLM, RAG, Agent, AI Agent, Machine Learning, Deep Learning, Neural Network, Tran
 - "OlmoEarth Satellite Model Family" (if AI Earth observation was announced)
 
 ## QUALITY RULES
+- **DEDUP FIRST**: If multiple candidates cover the same event/person/product (e.g. several articles about "DeepSeek V4"), MERGE them — pick the highest-tier version and IGNORE the duplicates. Your top 10 must be 10 DISTINCT stories.
 - Prioritize S-tier sources (official) over B-tier (aggregator) when the same event appears
 - Skip pure entertainment/consumer news. Focus on engineering, research, and industry impact
 - News should represent diverse categories (not all about the same topic)
